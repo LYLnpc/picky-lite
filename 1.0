@@ -1,0 +1,476 @@
+(function (thisObj) {
+    var win;
+    var statusText;
+    var btnAll;
+    var cachedRefLayer = null; // 缓存的参考图层（用于活动图层丢失时回退）
+
+    // ==================== UI ====================
+    function buildUI(thisObj) {
+        var w = (thisObj instanceof Panel)
+            ? thisObj
+            : new Window("palette", "Picky Lite", undefined, { resizeable: true });
+
+        w.orientation = "column";
+        w.alignChildren = ["fill", "top"];
+        w.spacing = 6;
+        w.margins = 10;
+        w.preferredSize.width = 280;
+
+        // ---------- 按类型全选 ----------
+        var typePanel = w.add("panel", undefined, "按类型全选");
+        typePanel.orientation = "column";
+        typePanel.alignChildren = ["fill", "top"];
+        typePanel.margins = 8;
+        typePanel.spacing = 4;
+
+        var typeGrid = typePanel.add("group");
+        typeGrid.orientation = "column";
+        typeGrid.alignChildren = ["fill", "top"];
+        typeGrid.spacing = 4;
+
+        var typeList = [
+            ["文本", "text"],      ["形状", "shape"],     ["纯色", "solid"],
+            ["图片", "image"],     ["视频", "video"],     ["音频", "audio"],
+            ["预合成", "precomp"], ["空对象", "null"],    ["摄像机", "camera"],
+            ["灯光", "light"],     ["调整图层", "adjust"], ["含音频", "hasAudio"]
+        ];
+
+        for (var r = 0; r < typeList.length; r += 3) {
+            var row = typeGrid.add("group");
+            row.orientation = "row";
+            row.alignChildren = ["fill", "fill"];
+            row.spacing = 4;
+
+            for (var c = 0; c < 3; c++) {
+                var idx = r + c;
+                if (idx >= typeList.length) break;
+                addButton(row, typeList[idx][0], typeList[idx][1], selectByType);
+            }
+        }
+
+        // ---------- 匹配活动图层 · 属性 ----------
+        var propPanel = w.add("panel", undefined, "匹配活动图层 · 属性");
+        propPanel.orientation = "column";
+        propPanel.alignChildren = ["fill", "top"];
+        propPanel.margins = 8;
+        propPanel.spacing = 4;
+
+        var propRow = propPanel.add("group");
+        propRow.orientation = "row";
+        propRow.alignChildren = ["fill", "fill"];
+        propRow.spacing = 4;
+
+        addButtonWide(propRow, "同类型", "sameType", matchAttribute);
+        addButtonWide(propRow, "同标签色", "sameLabel", matchAttribute);
+
+        // ---------- 匹配活动图层 · 链接 ----------
+        var linkPanel = w.add("panel", undefined, "匹配活动图层 · 链接");
+        linkPanel.orientation = "column";
+        linkPanel.alignChildren = ["fill", "top"];
+        linkPanel.margins = 8;
+        linkPanel.spacing = 4;
+
+        var linkRow1 = linkPanel.add("group");
+        linkRow1.orientation = "row";
+        linkRow1.alignChildren = ["fill", "fill"];
+        linkRow1.spacing = 4;
+        addButtonWide(linkRow1, "子链接", "children", matchLink);
+        addButtonWide(linkRow1, "父链接", "parents", matchLink);
+
+        var linkRow2 = linkPanel.add("group");
+        linkRow2.orientation = "row";
+        linkRow2.alignChildren = ["fill", "fill"];
+        linkRow2.spacing = 4;
+        addButtonWide(linkRow2, "父子链", "chain", matchLink);
+        addButtonWide(linkRow2, "全部关联", "allRelated", matchLink);
+
+        // ---------- 选择操作 ----------
+        var opPanel = w.add("panel", undefined, "选择操作");
+        opPanel.orientation = "column";
+        opPanel.alignChildren = ["fill", "top"];
+        opPanel.margins = 8;
+        opPanel.spacing = 4;
+
+        var opRow = opPanel.add("group");
+        opRow.orientation = "row";
+        opRow.alignChildren = ["fill", "fill"];
+        opRow.spacing = 4;
+
+        btnAll = opRow.add("button", undefined, "全选");
+        btnAll.preferredSize = [74, 24];
+        btnAll.onClick = toggleSelectAll;
+
+        var btnInvert = opRow.add("button", undefined, "反选");
+        btnInvert.preferredSize = [74, 24];
+        btnInvert.onClick = invertSelection;
+
+        var btnNone = opRow.add("button", undefined, "取消选择");
+        btnNone.preferredSize = [74, 24];
+        btnNone.onClick = deselectAll;
+
+        // ---------- 状态栏 ----------
+        statusText = w.add("statictext", undefined, "就绪");
+        statusText.alignment = ["fill", "bottom"];
+
+        w.layout.layout(true);
+        return w;
+    }
+
+    function addButton(row, label, type, handler) {
+        var btn = row.add("button", undefined, label);
+        btn.preferredSize = [78, 24];
+        btn.onClick = function () { handler(type, label); };
+    }
+
+    function addButtonWide(row, label, type, handler) {
+        var btn = row.add("button", undefined, label);
+        btn.preferredSize = [120, 24];
+        btn.onClick = function () { handler(type, label); };
+    }
+
+    // ==================== 工具函数 ====================
+    function getComp() {
+        var comp = app.project.activeItem;
+        if (!comp) {
+            updateStatus("⚠ 请先打开一个合成", true);
+            return null;
+        }
+        // 不依赖 instanceof：用 typeName 判定（新版 JS 引擎下更可靠）
+        var isComp = false;
+        try { isComp = (comp.typeName === "CompItem"); } catch (e0) {}
+        if (!isComp) {
+            try { isComp = (comp instanceof CompItem); } catch (e1) {}
+        }
+        if (!isComp) {
+            updateStatus("⚠ 请先打开一个合成", true);
+            return null;
+        }
+        return comp;
+    }
+
+    // ---------- 安全访问工具（新版 JS 引擎下 instanceof / 未定义属性可能抛错） ----------
+    function attrDefined(obj, name) {
+        try {
+            var v = obj[name];
+            return (v !== undefined && v !== null);
+        } catch (e) { return false; }
+    }
+
+    function hasProp(layer, matchName) {
+        try {
+            return (layer.property(matchName) !== null);
+        } catch (e) { return false; }
+    }
+
+    // ---------- 关键修复：锁定图层无法通过脚本改 selected ----------
+    // 临时解锁 -> 设置选中 -> 恢复锁定，否则会静默失败导致"选不中"
+    function setSelected(layer, state) {
+        try {
+            if (layer.locked) {
+                layer.locked = false;
+                layer.selected = state;
+                layer.locked = true;
+            } else {
+                layer.selected = state;
+            }
+        } catch (e) {}
+    }
+
+    function clearSelection(comp) {
+        for (var i = 1; i <= comp.layers.length; i++) {
+            setSelected(comp.layers[i], false);
+        }
+    }
+
+    function updateStatus(msg, warn) {
+        if (statusText) statusText.text = msg;
+    }
+
+    // ---------- 获取参考图层（核心修复） ----------
+    function getReferenceLayer(comp) {
+        // 1. 首选：合成当前活动图层
+        try {
+            if (comp.activeLayer) {
+                cachedRefLayer = comp.activeLayer;
+                return comp.activeLayer;
+            }
+        } catch (e) {}
+
+        // 2. 回退：当前选中的第一个图层
+        if (comp.selectedLayers && comp.selectedLayers.length > 0) {
+            cachedRefLayer = comp.selectedLayers[0];
+            return cachedRefLayer;
+        }
+
+        // 3. 最后回退：缓存的上次参考图层
+        if (cachedRefLayer && cachedRefLayer.containingComp === comp) {
+            return cachedRefLayer;
+        }
+
+        return null;
+    }
+
+    // ---------- 图层类型判定 ----------
+    // 修复历史：
+    // 1) instanceof 判图层类失效（图片/视频/音频/预合成/灯光全误判）
+    // 2) layer.property("匹配名") 查找也不可靠（灯光、摄像机、预合成仍误判，
+    //    且灯光/摄像机同时落入 other，导致"同类型"把两者一起选中）
+    // 最终方案：优先读图层自身的 matchName 属性（普通属性读取，跨版本跨语言稳定），
+    // 预合成用"source 拥有 layers 集合"的鸭子判定，彻底避开 instanceof / property() / typeName
+    function getLayerKind(layer) {
+        // 空对象 / 调整图层（标志属性，一直可靠）
+        if (attrDefined(layer, "nullLayer") && layer.nullLayer) return "null";
+        if (attrDefined(layer, "adjustmentLayer") && layer.adjustmentLayer) return "adjust";
+
+        // 图层 matchName：稳定且不依赖任何方法调用
+        var mn = "";
+        try { mn = layer.matchName || ""; } catch (e0) { mn = ""; }
+        if (mn === "ADBE Text Layer") return "text";
+        if (mn === "ADBE Vector Layer") return "shape";
+        if (mn === "ADBE Camera Layer") return "camera";
+        if (mn === "ADBE Light Layer") return "light";
+
+        // 兜底：特征属性组（仅当 matchName 读不到时才尝试）
+        if (mn === "") {
+            if (hasProp(layer, "ADBE Text Properties")) return "text";
+            if (hasProp(layer, "ADBE Root Vectors Group")) return "shape";
+            if (hasProp(layer, "ADBE Camera Options")) return "camera";
+            if (hasProp(layer, "ADBE Light Options")) return "light";
+        }
+
+        // 来源判定
+        var src = null;
+        try { src = layer.source; } catch (e1) { src = null; }
+        if (src) {
+            // 预合成：CompItem 独有特征是拥有 layers 集合（FootageItem 访问 .layers 会抛错）
+            var hasLayers = false;
+            try { hasLayers = (src.layers !== undefined && src.layers !== null); } catch (e2) {}
+            if (hasLayers) return "precomp";
+
+            var ms = null;
+            try { ms = src.mainSource; } catch (e3) {}
+            if (ms) {
+                // SolidSource 特有 color 属性
+                if (attrDefined(ms, "color")) return "solid";
+                // FileSource 特有 isStill 属性
+                var isStill = false;
+                try { isStill = (ms.isStill === true); } catch (e4) {}
+                if (isStill) return "image";
+            }
+        }
+
+        // 视频轨 / 音频轨兜底
+        var hasV = false, hasA = false;
+        try { hasV = (layer.hasVideo === true); } catch (e5) {}
+        try { hasA = (layer.hasAudio === true); } catch (e6) {}
+        if (hasV) return "video";
+        if (hasA) return "audio";
+        return "other";
+    }
+
+    // ---------- 按类型全选 ----------
+    function selectByType(type, label) {
+        var comp = getComp();
+        if (!comp) return;
+
+        clearSelection(comp);
+        var count = 0;
+
+        for (var i = 1; i <= comp.layers.length; i++) {
+            var layer = comp.layers[i];
+            var match = false;
+
+            if (type === "hasAudio") {
+                match = (layer.hasAudio === true);
+            } else {
+                match = (getLayerKind(layer) === type);
+            }
+
+            if (match) {
+                setSelected(layer, true);
+                count++;
+            }
+        }
+
+        if (count > 0) {
+            updateStatus("已选择 " + count + " 个" + label + "图层");
+        } else {
+            updateStatus("⚠ 未找到" + label + "图层", true);
+        }
+    }
+
+    // ---------- 匹配活动图层 · 属性 ----------
+    function matchAttribute(type, label) {
+        var comp = getComp();
+        if (!comp) return;
+
+        var ref = getReferenceLayer(comp);
+        if (!ref) {
+            updateStatus("⚠ 未找到活动图层", true);
+            return;
+        }
+
+        // 关键修复：先一次性算好参考图层的类型/标签，再动选择
+        // （避免清空选择过程中参考层状态变化导致匹配失效）
+        var refKind = null, refLabel = null;
+        try { refKind = getLayerKind(ref); } catch (e1) {}
+        try { refLabel = ref.label; } catch (e2) {}
+
+        var targets = [];
+        for (var i = 1; i <= comp.layers.length; i++) {
+            var layer = comp.layers[i];
+            var match = false;
+
+            if (type === "sameType") {
+                match = (refKind !== null && getLayerKind(layer) === refKind);
+            } else if (type === "sameLabel") {
+                match = (refLabel !== null && layer.label === refLabel);
+            }
+
+            if (match) targets.push(layer);
+        }
+
+        clearSelection(comp);
+        for (var j = 0; j < targets.length; j++) {
+            setSelected(targets[j], true);
+        }
+
+        if (targets.length > 0) {
+            updateStatus("已匹配 " + targets.length + " 个「" + label + "」图层");
+        } else {
+            updateStatus("⚠ 未找到匹配「" + label + "」图层", true);
+        }
+    }
+
+    // ---------- 匹配活动图层 · 链接 ----------
+    function getChildren(comp, targetLayer) {
+        var kids = [];
+        for (var i = 1; i <= comp.layers.length; i++) {
+            if (comp.layers[i].parent === targetLayer) {
+                kids.push(comp.layers[i]);
+            }
+        }
+        return kids;
+    }
+
+    function getDescendants(comp, layer) {
+        var all = [];
+        var stack = getChildren(comp, layer);
+        while (stack.length) {
+            var l = stack.shift();
+            all.push(l);
+            stack = stack.concat(getChildren(comp, l));
+        }
+        return all;
+    }
+
+    function getAncestors(layer) {
+        var all = [];
+        var p = layer.parent;
+        while (p) {
+            all.push(p);
+            p = p.parent;
+        }
+        return all;
+    }
+
+    function getRootAncestor(layer) {
+        var cur = layer;
+        while (cur.parent) cur = cur.parent;
+        return cur;
+    }
+
+    function matchLink(type, label) {
+        var comp = getComp();
+        if (!comp) return;
+
+        var ref = getReferenceLayer(comp);
+        if (!ref) {
+            updateStatus("⚠ 未找到活动图层", true);
+            return;
+        }
+
+        var targets = [];
+
+        if (type === "children") {
+            targets = getDescendants(comp, ref);
+        } else if (type === "parents") {
+            targets = getAncestors(ref);
+        } else if (type === "chain") {
+            targets = getAncestors(ref).concat(getDescendants(comp, ref));
+        } else if (type === "allRelated") {
+            var root = getRootAncestor(ref);
+            targets = getDescendants(comp, root);
+        }
+
+        clearSelection(comp);
+        for (var i = 0; i < targets.length; i++) {
+            setSelected(targets[i], true);
+        }
+
+        if (targets.length > 0) {
+            updateStatus("已选择 " + targets.length + " 个「" + label + "」图层");
+        } else {
+            updateStatus("⚠ 未找到「" + label + "」图层", true);
+        }
+    }
+
+    // ---------- 全选 / 取消全选 ----------
+    function toggleSelectAll() {
+        var comp = getComp();
+        if (!comp) return;
+
+        // 判断当前是否已经全选
+        var allOn = true;
+        for (var i = 1; i <= comp.layers.length; i++) {
+            if (!comp.layers[i].selected) { allOn = false; break; }
+        }
+
+        var newState = !allOn;
+        for (var j = 1; j <= comp.layers.length; j++) {
+            setSelected(comp.layers[j], newState);
+        }
+
+        btnAll.text = newState ? "取消全选" : "全选";
+        updateStatus(newState ? "已全选" : "已取消全选");
+    }
+
+    // ---------- 取消选择 ----------
+    function deselectAll() {
+        var comp = getComp();
+        if (!comp) return;
+
+        clearSelection(comp);
+        btnAll.text = "全选";
+        updateStatus("已取消选择");
+    }
+
+    // ---------- 反选 ----------
+    function invertSelection() {
+        var comp = getComp();
+        if (!comp) return;
+
+        for (var i = 1; i <= comp.layers.length; i++) {
+            var layer = comp.layers[i];
+            setSelected(layer, !layer.selected);
+        }
+
+        // 同步"全选"按钮状态
+        var allOn = true;
+        for (var j = 1; j <= comp.layers.length; j++) {
+            if (!comp.layers[j].selected) { allOn = false; break; }
+        }
+        btnAll.text = allOn ? "取消全选" : "全选";
+
+        updateStatus("已反选");
+    }
+
+    // ==================== 启动 ====================
+    var myPanel = buildUI(thisObj);
+    if (myPanel instanceof Window) {
+        myPanel.center();
+        myPanel.show();
+    } else {
+        myPanel.layout.layout(true);
+    }
+})(this);
